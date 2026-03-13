@@ -2283,9 +2283,17 @@ function App() {
   // ========== MAIN RENDER ==========
   return (
     <div className="app-container">
-      {/* Header */}
+      {/* ========== HEADER — Compact glassmorphism bar ========== */}
       <header className="app-header">
-        <h1><span>📷</span> Thu Bình Camera <span style={{ fontSize: 13, fontWeight: 400, color: 'var(--text-muted)', marginLeft: 8 }}>📞 0914003345</span></h1>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <h1>📷 Thu Bình Camera</h1>
+          {supaStorageInfo && (
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 5 }}>
+              <span style={{ color: 'var(--success)', fontSize: 8 }}>●</span>
+              ☁️ {supaStorageInfo.totalFiles} ảnh • {supaStorageInfo.totalMB.toFixed(0)}MB / {supa.MAX_STORAGE_MB}MB
+            </div>
+          )}
+        </div>
         <div className="api-key-bar">
           {keyValid !== null && <span className={`key-status ${keyValid ? 'valid' : 'invalid'}`}></span>}
           <input
@@ -2296,20 +2304,12 @@ function App() {
             onKeyDown={e => e.key === 'Enter' && handleVerifyKey()}
           />
           <button className="btn btn-secondary btn-sm" onClick={handleVerifyKey} disabled={loading}>
-            ✓ Xác thực
+            Xác thực
           </button>
         </div>
-
-        {/* Cloud Storage Status (auto-connected) */}
-        {supaStorageInfo && (
-          <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 }}>
-            <span style={{ color: '#4caf50' }}>●</span>
-            ☁️ {supaStorageInfo.totalFiles} ảnh • {supaStorageInfo.totalMB.toFixed(0)}MB / {supa.MAX_STORAGE_MB}MB
-          </div>
-        )}
       </header>
 
-      {/* Tabs */}
+      {/* ========== TABS — full-width nav strip ========== */}
       <div className="tabs-container">
         {[
           { id: 'edit', icon: '✏️', label: 'Chỉnh sửa' },
@@ -2331,32 +2331,22 @@ function App() {
         ))}
       </div>
 
-      {/* Main Content */}
-      <div className="main-content">
-        {/* Left - Controls */}
-        <div>
-          {activeTab === 'edit' && renderEditTab()}
-          {activeTab === 'composite' && renderCompositeTab()}
-          {activeTab === 'template' && renderTemplateTab()}
-          {activeTab === 'upscale' && renderUpscaleTab()}
-          {activeTab === 'faceswap' && renderFaceSwapTab()}
-          {activeTab === 'restore' && renderRestoreTab()}
-          {activeTab === 'batch' && renderBatchTab()}
-          {activeTab === 'library' && renderLibraryTab()}
-        </div>
-
-        {/* Right - Result + Logs */}
-        <div className="sidebar">
-          <div className="card">
-            <div className="card-title"><span>🖼️</span> Kết quả</div>
-            <div className="result-area">
+      {/* ========== MAIN — Studio layout: Result left, Controls right ========== */}
+      <div className="main-content" style={{ gridTemplateColumns: '1fr 420px' }}>
+        {/* LEFT — Result Preview (large, prominent) */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div className="card" style={{ flex: 1, minHeight: 460 }}>
+            <div className="card-title" style={{ justifyContent: 'space-between' }}>
+              <span>🖼️ Kết quả</span>
+              {resultImage && (
+                <button className="btn btn-primary btn-sm" onClick={handleDownload}>
+                  💾 Tải về
+                </button>
+              )}
+            </div>
+            <div className="result-area" style={{ minHeight: 400, borderRadius: 'var(--radius-lg)' }}>
               {resultImage ? (
-                <>
-                  <img src={`data:${resultImage.mimeType || 'image/png'};base64,${resultImage.data}`} alt="result" />
-                  <button className="download-btn" onClick={handleDownload}>
-                    💾 Tải về
-                  </button>
-                </>
+                <img src={`data:${resultImage.mimeType || 'image/png'};base64,${resultImage.data}`} alt="result" />
               ) : (
                 <div className="result-placeholder">
                   <div className="placeholder-icon">🎨</div>
@@ -2366,7 +2356,7 @@ function App() {
             </div>
           </div>
 
-          {/* Status Bar */}
+          {/* Status + Cost bar below result */}
           <div className="status-bar">
             <div className="status-text">
               <span className={`status-dot ${loading ? 'loading' : ''}`}></span>
@@ -2377,6 +2367,18 @@ function App() {
               <span className="cost-value">${getTotalCost().toFixed(3)}</span>
             </div>
           </div>
+        </div>
+
+        {/* RIGHT — Controls + Logs (scrollable) */}
+        <div className="sidebar" style={{ maxHeight: 'calc(100vh - 140px)', overflowY: 'auto' }}>
+          {activeTab === 'edit' && renderEditTab()}
+          {activeTab === 'composite' && renderCompositeTab()}
+          {activeTab === 'template' && renderTemplateTab()}
+          {activeTab === 'upscale' && renderUpscaleTab()}
+          {activeTab === 'faceswap' && renderFaceSwapTab()}
+          {activeTab === 'restore' && renderRestoreTab()}
+          {activeTab === 'batch' && renderBatchTab()}
+          {activeTab === 'library' && renderLibraryTab()}
 
           {/* Logs */}
           <div className="logs-panel">

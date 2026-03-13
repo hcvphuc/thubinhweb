@@ -2,6 +2,8 @@ import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import './App.css';
 import { saveTemplateData, getAllTemplateData, deleteTemplateData, migrateOldRefs } from './db.js';
 import { validateFaceAnatomy } from './FaceQC.js';
+import { validateRestoration } from './RestoreQC.js';
+import { compareFaces, preloadFaceCompare } from './FaceCompare.js';
 import * as supa from './supabaseStorage.js';
 
 // ========== HELPER: Read file as base64 ==========
@@ -44,8 +46,8 @@ function compressBase64Image(base64, maxSize = 1024, quality = 0.8) {
 }
 
 // ========== HELPER: Fetch with timeout + auto-retry on 503/429/500/449 ==========
-async function fetchWithRetry(url, options, maxRetries = 5, logFn = null) {
-  const RETRY_DELAYS = [5000, 15000, 30000, 60000, 60000]; // exponential backoff
+async function fetchWithRetry(url, options, maxRetries = 3, logFn = null) {
+  const RETRY_DELAY = 15000; // 15s between retries
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 180000); // 180s timeout
@@ -53,22 +55,32 @@ async function fetchWithRetry(url, options, maxRetries = 5, logFn = null) {
       const res = await fetch(url, { ...options, signal: controller.signal });
       clearTimeout(timeout);
       if (res.ok) return res;
-      // Retry on server overload errors
-      if ([503, 429, 500, 449].includes(res.status) && attempt < maxRetries) {
-        const wait = RETRY_DELAYS[attempt - 1] || 60000;
-        if (logFn) logFn(`⏳ API ${res.status} — retry ${attempt}/${maxRetries} in ${wait / 1000}s...`);
-        await new Promise(r => setTimeout(r, wait));
+      // Retry on server overload / rate limit errors
+      if ([503, 429, 500, 449, 502, 504].includes(res.status) && attempt < maxRetries) {
+        if (logFn) logFn(`⏳ API lỗi ${res.status} — chờ 15s rồi thử lại (${attempt}/${maxRetries})...`);
+        // Countdown timer in logs
+        for (let s = 15; s > 0; s--) {
+          await new Promise(r => setTimeout(r, 1000));
+          if (logFn && s % 5 === 0) logFn(`⏳ Thử lại sau ${s}s...`);
+        }
         continue;
       }
-      throw new Error(`API: ${res.status}${attempt > 1 ? ` (after ${attempt} tries)` : ''}`);
+      throw new Error(`API: ${res.status}${attempt > 1 ? ` (sau ${attempt} lần thử)` : ''}`);
     } catch (e) {
       clearTimeout(timeout);
       if (e.name === 'AbortError') {
         if (attempt < maxRetries) {
-          if (logFn) logFn(`⏳ Timeout — retry ${attempt}/${maxRetries}...`);
+          if (logFn) logFn(`⏳ Timeout — chờ 15s rồi thử lại (${attempt}/${maxRetries})...`);
+          await new Promise(r => setTimeout(r, RETRY_DELAY));
           continue;
         }
         throw new Error('Request timeout (180s) — API quá chậm. Thử lại sau.');
+      }
+      // Network error — also retry
+      if (attempt < maxRetries && (e.message.includes('Failed to fetch') || e.message.includes('NetworkError') || e.message.includes('network'))) {
+        if (logFn) logFn(`⏳ Lỗi mạng: ${e.message} — chờ 15s rồi thử lại (${attempt}/${maxRetries})...`);
+        await new Promise(r => setTimeout(r, RETRY_DELAY));
+        continue;
       }
       throw e;
     }
@@ -208,6 +220,13 @@ function App() {
   const [faceRefImage, setFaceRefImage] = useState('');
   const [faceTargetImage, setFaceTargetImage] = useState('');
 
+  // Restore tab
+  const [restoreImage, setRestoreImage] = useState('');
+  const [restoreDamageLevel, setRestoreDamageLevel] = useState(2);
+  const [restoreCustomPrompt, setRestoreCustomPrompt] = useState('');
+  const [restoreScores, setRestoreScores] = useState(null);
+  const [restoreAttempts, setRestoreAttempts] = useState([]); // { attempt, imgData, mimeType, scores, avgScore, passed }
+
   // Batch tab
   const [batchFiles, setBatchFiles] = useState([]); // File objects
   const [batchMode, setBatchMode] = useState('composite'); // 'composite' or 'template'
@@ -235,6 +254,7 @@ function App() {
   const faceTargetFileRef = useRef(null);
   const batchFileRef = useRef(null);
   const batchBgFileRef = useRef(null);
+  const restoreFileRef = useRef(null);
 
   // Logs toggle
   const [showLogs, setShowLogs] = useState(false);
@@ -810,6 +830,260 @@ function App() {
       setStatus('Xong!');
       addLog('Face swapped!');
       autoUploadToSupabase(result.data, result.mimeType, 'faceswap');
+    } catch (e) {
+      addLog('Error: ' + e.message);
+      setStatus('Lỗi');
+      alert(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ========== RESTORE: Damage level definitions with level-specific prompts ==========
+  const DAMAGE_LEVELS = [
+    {
+      level: 1, icon: '🟢', name: 'Nhẹ', desc: 'Hơi ngả vàng, bụi nhẹ, nhạt màu',
+      strategy: [
+        'This photo has MINOR damage: slight yellowing, light dust, mild color fading.',
+        'STRATEGY: Gentle color correction only. Keep 95% of the original pixels unchanged.',
+        'Fix white balance, remove yellow/sepia cast, restore original vibrant colors.',
+        'Remove only visible dust spots and minor scratches. Do NOT alter any details.',
+        'Preserve every facial feature, texture, wrinkle, and expression exactly as-is.',
+      ]
+    },
+    {
+      level: 2, icon: '🟡', name: 'Trung bình', desc: 'Phai màu, vết gấp, nhiễu hạt',
+      strategy: [
+        'This photo has MODERATE damage: faded colors, visible creases/fold lines, film grain, age spots.',
+        'STRATEGY: Color restoration + crease removal. Keep 85% of original content unchanged.',
+        'Restore full color spectrum — make colors vivid and natural as when originally taken.',
+        'Remove fold creases, grain, and age spots while keeping all underlying details intact.',
+        'Preserve all facial features, clothing patterns, and background objects with high fidelity.',
+      ]
+    },
+    {
+      level: 3, icon: '🟠', name: 'Nặng', desc: 'Rách, vết ố lớn, mất chi tiết',
+      strategy: [
+        'This photo has HEAVY damage: tears, large stains/water damage, missing details in some areas.',
+        'STRATEGY: Inpainting + reconstruction. Rebuild damaged areas based on surrounding context.',
+        'For torn/missing sections: intelligently reconstruct using visible context clues nearby.',
+        'For stained areas: remove stains completely and restore original content underneath.',
+        'CRITICAL: Faces must be reconstructed to match remaining visible facial features exactly — same bone structure, same proportions. Use visible parts as reference.',
+      ]
+    },
+    {
+      level: 4, icon: '🔴', name: 'Rất nặng', desc: 'Hư hại nghiêm trọng, mất phần lớn',
+      strategy: [
+        'This photo has SEVERE damage: large missing areas, heavy deterioration, barely visible content.',
+        'STRATEGY: Full AI reconstruction. Use any remaining visible content as the strict reference.',
+        'Reconstruct all missing areas — faces, bodies, backgrounds — based on what is still visible.',
+        'For faces: match any remaining facial features (even partial) to rebuild a consistent, realistic face. Same age, same ethnicity, same expression if detectable.',
+        'For backgrounds/objects: reconstruct logically consistent scenery based on context clues.',
+        'IMPORTANT: Even with heavy reconstruction, the result must look like a REAL vintage photograph restored — not AI-generated art.',
+      ]
+    },
+  ];
+
+  // ========== RESTORE: Handle photo restoration ==========
+  async function handleRestore() {
+    if (!restoreImage) { alert('Chưa upload ảnh!'); return; }
+    if (!key.trim()) { alert('Thiếu Key'); return; }
+
+    setLoading(true);
+    setRestoreScores(null);
+    setRestoreAttempts([]);
+    addLog('=== PHOTO RESTORE ===');
+    const damageInfo = DAMAGE_LEVELS.find(d => d.level === restoreDamageLevel) || DAMAGE_LEVELS[1];
+    addLog(`Damage level: ${damageInfo.name} (${damageInfo.level}/4)`);
+
+    try {
+      setStatus('Đang nén ảnh...');
+      const compressedOrig = await compressBase64Image(restoreImage, 1536, 0.85);
+      addLog(`Compressed: ${(compressedOrig.length / 1024).toFixed(0)}KB`);
+
+      // Build restoration prompt — level-specific strategy + professional quality keywords
+      const basePrompt = [
+        // LEVEL-SPECIFIC STRATEGY
+        ...damageInfo.strategy,
+        // UNIVERSAL QUALITY — applies to all levels
+        'Preserve original identity, facial structure, proportions and composition exactly.',
+        'High-fidelity photo restoration, ultra-realistic, natural skin texture, accurate details, professional photographic look.',
+        '4K output, sharp but natural focus, professional color grading, HDR. Shot on Arri Alexa, raw photo aesthetic, masterpiece.',
+        // SEMANTIC NEGATIVE — what to avoid
+        'Do NOT creatively reinterpret, change style, alter identity, reshape faces, or exaggerate features.',
+        'The result must look like a real restored photograph — not a painting, illustration, or cartoon.',
+        'Avoid over-sharpening, plastic skin, film grain, jpeg artifacts, distortion, bad anatomy, overexposure, underexposure, or washed out colors.',
+        // CUSTOM from user
+        restoreCustomPrompt || ''
+      ].filter(Boolean).join(' ');
+
+      // Preload ArcFace + MediaPipe models while generating image
+      preloadFaceCompare().then(ok => addLog(ok ? '✅ ArcFace + MediaPipe ready' : '⚠ FaceCompare unavailable'));
+
+      // Restore + QC loop (max 3 attempts)
+      let bestResult = null;
+      let bestScores = null;
+      let bestScore = -1;
+      const MAX_ATTEMPTS = 3;
+
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        setStatus(`Phục hồi ảnh (lần ${attempt}/${MAX_ATTEMPTS})...`);
+        addLog(`--- Attempt ${attempt}/${MAX_ATTEMPTS} ---`);
+
+        // Build prompt with detailed fix instructions for retry
+        let finalPrompt = basePrompt;
+        let requestParts = [
+          { inlineData: { mimeType: 'image/jpeg', data: compressedOrig } },
+        ];
+
+        if (attempt > 1 && bestResult && bestScores && !bestScores.pass) {
+          // === RETRY: send original + failed result + specific fix instructions ===
+          const fixInstructions = [];
+          fixInstructions.push('I am providing TWO images: the ORIGINAL damaged photo (first) and your PREVIOUS restoration attempt (second).');
+          fixInstructions.push('Your previous attempt had these problems that MUST be fixed:');
+
+          let priority = 1;
+          if (bestScores.face < 9) {
+            fixInstructions.push(`${priority}. FACE IDENTITY MISMATCH (score: ${bestScores.face}/10, needs ≥9): The restored face does NOT look like the same person. You MUST preserve the EXACT same facial bone structure, eye shape, nose shape, mouth shape, jawline, and facial proportions from the original photo. Do not make the person look younger, older, or different.`);
+            priority++;
+          }
+          if (bestScores.objects < 8) {
+            fixInstructions.push(`${priority}. OBJECTS/BACKGROUND WRONG (score: ${bestScores.objects}/10, needs ≥8): Background objects, furniture, or environment elements are missing, changed, or incorrectly reconstructed. Keep all objects exactly as they appear in the original.`);
+            priority++;
+          }
+          if (bestScores.clothing < 8) {
+            fixInstructions.push(`${priority}. CLOTHING/ACCESSORIES WRONG (score: ${bestScores.clothing}/10, needs ≥8): Clothing pattern, style, or accessories have been altered. Preserve the exact same outfit, jewelry, hat, glasses, etc.`);
+            priority++;
+          }
+          if (bestScores.color < 8) {
+            fixInstructions.push(`${priority}. COLOR FIDELITY POOR (score: ${bestScores.color}/10, needs ≥8): Colors are unnatural, washed out, or don't match what the original colors would have been. Make colors vivid, realistic, and consistent.`);
+            priority++;
+          }
+
+          fixInstructions.push('Please generate a NEW restoration that fixes ALL of the above issues while keeping the good aspects of the previous attempt.');
+
+          finalPrompt = basePrompt + '\n\n' + fixInstructions.join('\n');
+
+          // Compress previous result to avoid 503 (raw can be 40MB+)
+          const compressedPrevResult = await compressBase64Image(bestResult.data, 1536, 0.8);
+          addLog(`Compressed previous result: ${(compressedPrevResult.length / 1024).toFixed(0)}KB`);
+
+          // Send both: original (first) + compressed previous result (second)
+          requestParts = [
+            { inlineData: { mimeType: 'image/jpeg', data: compressedOrig } },
+            { inlineData: { mimeType: 'image/jpeg', data: compressedPrevResult } },
+            { text: finalPrompt }
+          ];
+
+          addLog(`Retry with fix: sending original + previous result + ${priority - 1} fix instructions`);
+        } else {
+          requestParts.push({ text: finalPrompt });
+        }
+
+        const restoreRes = await fetchWithRetry(apiUrl('gemini-3.1-flash-image-preview'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: requestParts }],
+            generationConfig: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K' } }
+          })
+        }, 3, addLog);
+        const restoreData = await restoreRes.json();
+
+        const responseText = extractText(restoreData);
+        if (responseText) addLog(`API text: ${responseText.substring(0, 200)}`);
+
+        const img = extractImage(restoreData);
+        if (!img) {
+          const blockReason = restoreData?.candidates?.[0]?.finishReason || restoreData?.promptFeedback?.blockReason || 'unknown';
+          addLog(`⚠ No image returned. Reason: ${blockReason}`);
+          if (attempt === MAX_ATTEMPTS && bestResult) break;
+          continue;
+        }
+        addCost('image', 1);
+        addCost('textInput', 1500);
+        addLog(`✓ Image restored! ${(img.data.length / 1024).toFixed(0)}KB`);
+
+        // 💾 Save immediately (even before QC scoring)
+        autoUploadToSupabase(img.data, img.mimeType, `restore_attempt${attempt}`);
+        addLog(`💾 Saved attempt ${attempt} to cloud`);
+
+        // ====== QC: ArcFace for face identity + Gemini for objects/clothing/color ======
+        setStatus(`Chấm điểm (lần ${attempt}/${MAX_ATTEMPTS})...`);
+
+        // Step A: ArcFace face identity comparison (FREE, local, 512D embedding)
+        addLog(`🔍 ArcFace face identity check...`);
+        const faceResult = await compareFaces(compressedOrig, img.data);
+        addLog(`Face: ${faceResult.score}/10 (cosine: ${faceResult.cosine ?? 'N/A'}) — ${faceResult.details}`);
+
+        // Step B: Gemini QC for objects/clothing/color
+        addLog(`🔍 Gemini QC (objects/clothing/color)...`);
+        const qc = await validateRestoration(compressedOrig, img.data, key.trim());
+        addCost('textInput', 800);
+
+        // Combine: ArcFace for face, Gemini for rest
+        const combinedScores = {
+          face: faceResult.hasFace ? faceResult.score : qc.scores.face,
+          objects: qc.scores.objects,
+          clothing: qc.scores.clothing,
+          color: qc.scores.color
+        };
+
+        const avgScore = (combinedScores.face + combinedScores.objects + combinedScores.clothing + combinedScores.color) / 4;
+        const facePassed = combinedScores.face >= 9;
+        const objectsPassed = combinedScores.objects >= 8 && combinedScores.clothing >= 8 && combinedScores.color >= 8;
+        const allPassed = facePassed && objectsPassed;
+
+        addLog(`Scores — Face: ${combinedScores.face}/10${faceResult.hasFace ? ' (ArcFace)' : ' (Gemini)'}, Objects: ${combinedScores.objects}/10, Clothing: ${combinedScores.clothing}/10, Color: ${combinedScores.color}/10`);
+
+        // Build issues
+        const issues = [];
+        if (!facePassed) issues.push(`Face ${combinedScores.face}/10 (cần ≥9) — ${faceResult.details}`);
+        if (combinedScores.objects < 8) issues.push(`Objects ${combinedScores.objects}/10 (cần ≥8)`);
+        if (combinedScores.clothing < 8) issues.push(`Clothing ${combinedScores.clothing}/10 (cần ≥8)`);
+        if (combinedScores.color < 8) issues.push(`Color ${combinedScores.color}/10 (cần ≥8)`);
+        const issueText = issues.join('; ') || qc.issues;
+
+        // Save attempt to state for gallery display
+        setRestoreAttempts(prev => [...prev, {
+          attempt,
+          imgData: img.data,
+          mimeType: img.mimeType || 'image/jpeg',
+          scores: { ...combinedScores },
+          avgScore: Math.round(avgScore * 10) / 10,
+          passed: allPassed,
+          cosine: faceResult.cosine,
+          faceMethod: faceResult.hasFace ? 'ArcFace' : 'Gemini'
+        }]);
+
+        if (avgScore > bestScore) {
+          bestScore = avgScore;
+          bestResult = img;
+          bestScores = { ...combinedScores, issues: issueText, pass: allPassed, faceMethod: faceResult.hasFace ? 'ArcFace' : 'Gemini', cosine: faceResult.cosine };
+        }
+
+        if (allPassed) {
+          addLog(`✓ Quality PASSED on attempt ${attempt}! 🎉`);
+          break;
+        } else {
+          addLog(`⚠ Quality not met: ${issueText}`);
+          if (attempt < MAX_ATTEMPTS) {
+            addLog(`Retrying with detailed fix instructions + previous result image...`);
+          } else {
+            addLog(`⚠ Max attempts reached. Using best result (avg: ${bestScore.toFixed(1)})`);
+          }
+        }
+      }
+
+      if (bestResult) {
+        setResultImage(bestResult);
+        setRestoreScores(bestScores);
+        setStatus(bestScores.pass ? '✅ Phục hồi hoàn tất!' : '⚠️ Phục hồi xong (chưa đạt tối đa)');
+        addLog('RESTORE COMPLETE!');
+        autoUploadToSupabase(bestResult.data, bestResult.mimeType, 'restore_best');
+      } else {
+        throw new Error('API không trả về hình ảnh. Kiểm tra logs để biết chi tiết. Thử ảnh khác hoặc giảm mức độ tổn hại.');
+      }
     } catch (e) {
       addLog('Error: ' + e.message);
       setStatus('Lỗi');
@@ -1604,6 +1878,87 @@ function App() {
     );
   }
 
+  function renderRestoreTab() {
+    const damageInfo = DAMAGE_LEVELS.find(d => d.level === restoreDamageLevel) || DAMAGE_LEVELS[1];
+    return (
+      <div className="fade-in">
+        <div className="card" style={{ marginBottom: 16 }}>
+          <div className="card-title"><span>📸</span> Ảnh cũ cần phục hồi</div>
+          <UploadZone image={restoreImage} setter={setRestoreImage} fileRef={restoreFileRef} label="Upload ảnh cũ / hư hại" />
+        </div>
+
+        <div className="card" style={{ marginBottom: 16 }}>
+          <div className="card-title"><span>⚡</span> Mức độ tổn hại</div>
+          <div className="ratio-grid">
+            {DAMAGE_LEVELS.map(d => (
+              <button
+                key={d.level}
+                className={`ratio-btn ${restoreDamageLevel === d.level ? 'active' : ''}`}
+                onClick={() => setRestoreDamageLevel(d.level)}
+                title={d.desc}
+              >
+                {d.icon} {d.name}
+              </button>
+            ))}
+          </div>
+          <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+            {damageInfo.icon} <strong>{damageInfo.name}</strong>: {damageInfo.desc}
+          </div>
+        </div>
+
+        <div className="card" style={{ marginBottom: 16 }}>
+          <div className="card-title"><span>💬</span> Yêu cầu bổ sung <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--text-muted)' }}>(tuỳ chọn)</span></div>
+          <input
+            className="input-field"
+            value={restoreCustomPrompt}
+            onChange={e => setRestoreCustomPrompt(e.target.value)}
+            placeholder="Ví dụ: ảnh đen trắng, tô màu tự nhiên..."
+          />
+        </div>
+
+        {/* Quality Scores */}
+        {restoreScores && (
+          <div className="card" style={{ marginBottom: 16 }}>
+            <div className="card-title"><span>📊</span> Điểm chất lượng</div>
+            {[
+              { key: 'face', label: '👤 Khuôn mặt', threshold: 9, method: restoreScores.faceMethod },
+              { key: 'objects', label: '🏠 Vật thể', threshold: 8 },
+              { key: 'clothing', label: '👔 Trang phục', threshold: 8 },
+              { key: 'color', label: '🎨 Màu sắc', threshold: 8 },
+            ].map(item => {
+              const score = restoreScores[item.key] || 0;
+              const passed = score >= item.threshold;
+              const pct = (score / 10) * 100;
+              const color = passed ? '#4caf50' : score >= item.threshold - 1 ? '#ff9800' : '#f44336';
+              return (
+                <div key={item.key} style={{ marginBottom: 10 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 4 }}>
+                    <span>{item.label} {item.method && <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>({item.method}{restoreScores.cosine != null && item.key === 'face' ? ` · cos: ${restoreScores.cosine}` : ''})</span>}</span>
+                    <span style={{ fontWeight: 700, color }}>
+                      {score}/10 {passed ? '✓' : '✗'}
+                      <span style={{ fontSize: 10, fontWeight: 400, color: 'var(--text-muted)', marginLeft: 4 }}>(cần ≥{item.threshold})</span>
+                    </span>
+                  </div>
+                  <div style={{ height: 6, background: 'rgba(255,255,255,0.1)', borderRadius: 3, overflow: 'hidden' }}>
+                    <div style={{ height: '100%', width: `${pct}%`, background: color, borderRadius: 3, transition: 'width 0.5s ease' }} />
+                  </div>
+                </div>
+              );
+            })}
+            {restoreScores.pass
+              ? <div style={{ marginTop: 8, padding: '8px 12px', background: 'rgba(76,175,80,0.15)', borderRadius: 8, fontSize: 13, color: '#4caf50' }}>✅ Đạt chuẩn chất lượng!</div>
+              : <div style={{ marginTop: 8, padding: '8px 12px', background: 'rgba(255,152,0,0.15)', borderRadius: 8, fontSize: 13, color: '#ff9800' }}>⚠️ Chưa đạt tối đa — đây là kết quả tốt nhất sau 3 lần thử</div>
+            }
+          </div>
+        )}
+
+        <button className="btn btn-primary btn-lg" onClick={handleRestore} disabled={loading || !restoreImage} style={{ width: '100%' }}>
+          🔧 Phục hồi ảnh
+        </button>
+      </div>
+    );
+  }
+
   function renderBatchTab() {
     const babyTemplates = allTemplates.filter(t => t.category === 'baby');
     const familyTemplates = allTemplates.filter(t => t.category === 'family');
@@ -1883,7 +2238,7 @@ function App() {
               const sizeMB = ((file.metadata?.size || 0) / (1024 * 1024)).toFixed(1);
               const date = file.created_at ? new Date(file.created_at) : null;
               const dateStr = date ? `${date.getDate()}/${date.getMonth() + 1} ${date.getHours()}:${String(date.getMinutes()).padStart(2, '0')}` : '';
-              const typeIcon = file.name.startsWith('template') ? '🏮' : file.name.startsWith('composite') ? '🎭' : file.name.startsWith('edit') ? '✏️' : file.name.startsWith('upscale') ? '⬆️' : file.name.startsWith('faceswap') ? '🔄' : '📷';
+              const typeIcon = file.name.startsWith('template') ? '🏮' : file.name.startsWith('composite') ? '🎭' : file.name.startsWith('edit') ? '✏️' : file.name.startsWith('upscale') ? '⬆️' : file.name.startsWith('faceswap') ? '🔄' : file.name.startsWith('restore') ? '🔧' : '📷';
               return (
                 <div key={i} className="card" style={{ padding: 0, overflow: 'hidden', cursor: 'pointer', transition: 'transform 0.2s', position: 'relative' }}
                   onMouseEnter={e => e.currentTarget.style.transform = 'scale(1.03)'}
@@ -1962,6 +2317,7 @@ function App() {
           { id: 'template', icon: '🏮', label: 'Template' },
           { id: 'upscale', icon: '⬆️', label: 'Upscale 4K' },
           { id: 'faceswap', icon: '🔄', label: 'Face Swap' },
+          { id: 'restore', icon: '🔧', label: 'Phục hồi' },
           { id: 'batch', icon: '📂', label: 'Batch' },
           { id: 'library', icon: '🖼️', label: 'Thư viện' },
         ].map(tab => (
@@ -1984,6 +2340,7 @@ function App() {
           {activeTab === 'template' && renderTemplateTab()}
           {activeTab === 'upscale' && renderUpscaleTab()}
           {activeTab === 'faceswap' && renderFaceSwapTab()}
+          {activeTab === 'restore' && renderRestoreTab()}
           {activeTab === 'batch' && renderBatchTab()}
           {activeTab === 'library' && renderLibraryTab()}
         </div>
@@ -2039,12 +2396,157 @@ function App() {
         </div>
       </div>
 
-      {/* Loading Overlay */}
+      {/* Loading Overlay — 2 columns: Image Gallery + Realtime Logs */}
       {loading && (
-        <div className="loading-overlay">
-          <div style={{ textAlign: 'center' }}>
-            <div className="loading-spinner"></div>
-            <div className="loading-text">{status}</div>
+        <div className="loading-overlay" style={{ flexDirection: 'column', gap: 0, padding: '16px 20px', alignItems: 'center' }}>
+          {/* Status bar */}
+          <div style={{ textAlign: 'center', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div className="loading-spinner" style={{ width: 24, height: 24, borderWidth: 3 }}></div>
+            <div className="loading-text" style={{ fontSize: 14 }}>{status}</div>
+          </div>
+
+          {/* 2-column layout */}
+          <div style={{
+            display: 'flex', gap: 12, width: '100%', maxWidth: 1100, maxHeight: '75vh',
+            flex: 1, minHeight: 0
+          }}>
+            {/* LEFT: Image comparison gallery */}
+            <div style={{
+              flex: '0 0 55%', background: 'rgba(0,0,0,0.85)', borderRadius: 12,
+              border: '1px solid rgba(255,255,255,0.1)', overflow: 'hidden',
+              display: 'flex', flexDirection: 'column'
+            }}>
+              <div style={{ padding: '10px 14px', borderBottom: '1px solid rgba(255,255,255,0.1)', fontSize: 13, fontWeight: 600, color: 'var(--text-muted)' }}>
+                🖼️ So sánh versions {restoreAttempts.length > 0 && `(${restoreAttempts.length} lần)`}
+              </div>
+              <div style={{
+                flex: 1, overflowY: 'auto', padding: 12,
+                display: 'flex', flexWrap: 'wrap', gap: 10, alignContent: 'flex-start'
+              }}>
+                {/* Original image */}
+                {restoreImage && (
+                  <div style={{
+                    width: 'calc(50% - 5px)', background: 'rgba(255,255,255,0.05)',
+                    borderRadius: 10, overflow: 'hidden', border: '2px solid rgba(100,181,246,0.4)'
+                  }}>
+                    <div style={{ position: 'relative' }}>
+                      <img
+                        src={restoreImage.startsWith('data:') ? restoreImage : `data:image/jpeg;base64,${restoreImage}`}
+                        alt="Original"
+                        style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', display: 'block' }}
+                      />
+                      <div style={{
+                        position: 'absolute', top: 6, left: 6, background: '#1976d2',
+                        color: '#fff', fontSize: 10, fontWeight: 700, padding: '2px 8px',
+                        borderRadius: 4
+                      }}>GỐC</div>
+                    </div>
+                    <div style={{ padding: '6px 8px', fontSize: 10, color: 'var(--text-muted)' }}>
+                      Ảnh gốc (trước phục hồi)
+                    </div>
+                  </div>
+                )}
+
+                {/* Generated versions */}
+                {restoreAttempts.map((ver) => {
+                  const scoreColor = ver.passed ? '#4caf50' : ver.avgScore >= 7 ? '#ff9800' : '#f44336';
+                  return (
+                    <div key={ver.attempt} style={{
+                      width: 'calc(50% - 5px)', background: 'rgba(255,255,255,0.05)',
+                      borderRadius: 10, overflow: 'hidden',
+                      border: `2px solid ${ver.passed ? 'rgba(76,175,80,0.5)' : 'rgba(255,255,255,0.1)'}`
+                    }}>
+                      <div style={{ position: 'relative' }}>
+                        <img
+                          src={`data:${ver.mimeType};base64,${ver.imgData}`}
+                          alt={`Attempt ${ver.attempt}`}
+                          style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', display: 'block' }}
+                        />
+                        <div style={{
+                          position: 'absolute', top: 6, left: 6, background: scoreColor,
+                          color: '#fff', fontSize: 10, fontWeight: 700, padding: '2px 8px',
+                          borderRadius: 4
+                        }}>{ver.passed ? '✓ PASS' : `#${ver.attempt}`}</div>
+                        <div style={{
+                          position: 'absolute', top: 6, right: 6, background: 'rgba(0,0,0,0.7)',
+                          color: scoreColor, fontSize: 12, fontWeight: 700, padding: '2px 8px',
+                          borderRadius: 4
+                        }}>{ver.avgScore}/10</div>
+                      </div>
+                      <div style={{ padding: '6px 8px' }}>
+                        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                          {[
+                            { key: 'face', icon: '👤', threshold: 9 },
+                            { key: 'objects', icon: '🏠', threshold: 8 },
+                            { key: 'clothing', icon: '👔', threshold: 8 },
+                            { key: 'color', icon: '🎨', threshold: 8 }
+                          ].map(s => {
+                            const val = ver.scores[s.key];
+                            const ok = val >= s.threshold;
+                            return (
+                              <span key={s.key} style={{
+                                fontSize: 9, padding: '1px 5px', borderRadius: 3,
+                                background: ok ? 'rgba(76,175,80,0.15)' : 'rgba(244,67,54,0.15)',
+                                color: ok ? '#4caf50' : '#f44336',
+                                fontWeight: 600
+                              }}>{s.icon}{val}</span>
+                            );
+                          })}
+                        </div>
+                        {ver.cosine != null && (
+                          <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 3 }}>
+                            {ver.faceMethod} cos: {ver.cosine}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+
+                {/* Placeholder when no attempts yet */}
+                {restoreAttempts.length === 0 && (
+                  <div style={{
+                    width: 'calc(50% - 5px)', background: 'rgba(255,255,255,0.03)',
+                    borderRadius: 10, border: '2px dashed rgba(255,255,255,0.1)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    aspectRatio: '1', color: 'var(--text-muted)', fontSize: 12
+                  }}>
+                    Đang tạo ảnh...
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* RIGHT: Realtime Logs */}
+            <div style={{
+              flex: '0 0 45%', background: 'rgba(0,0,0,0.85)', borderRadius: 12,
+              border: '1px solid rgba(255,255,255,0.1)', overflow: 'hidden',
+              display: 'flex', flexDirection: 'column'
+            }}>
+              <div style={{ padding: '10px 14px', borderBottom: '1px solid rgba(255,255,255,0.1)', fontSize: 13, fontWeight: 600, color: 'var(--text-muted)' }}>
+                📋 Realtime Logs ({logs.length})
+              </div>
+              <div
+                ref={el => { if (el) el.scrollTop = el.scrollHeight; }}
+                style={{
+                  flex: 1, overflowY: 'auto', padding: '8px 14px',
+                  fontFamily: 'monospace', fontSize: 11, lineHeight: 1.6
+                }}
+              >
+                {[...logs].reverse().map((log, i, arr) => (
+                  <div key={arr.length - 1 - i} style={{
+                    color: log.includes('✓') || log.includes('✅') || log.includes('PASS') ? '#4caf50'
+                      : log.includes('⚠') || log.includes('❌') ? '#ff9800'
+                      : log.includes('Error') ? '#f44336'
+                      : log.includes('🔍') || log.includes('💾') ? '#64b5f6'
+                      : 'rgba(255,255,255,0.75)',
+                    borderBottom: '1px solid rgba(255,255,255,0.04)',
+                    padding: '2px 0'
+                  }}>{log}</div>
+                ))}
+                {logs.length === 0 && <div style={{ color: 'var(--text-muted)' }}>Đang khởi tạo...</div>}
+              </div>
+            </div>
           </div>
         </div>
       )}
